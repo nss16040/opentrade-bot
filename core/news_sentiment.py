@@ -1,6 +1,10 @@
 import re
 from typing import List, Dict
 import yfinance as yf
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from typing import Any
 
 
 POSITIVE_WORDS = {
@@ -31,6 +35,43 @@ def _score_headline(headline: str) -> int:
     return score
 
 
+def _fetch_google_news(query: str, max_headlines: int = 5) -> List[str]:
+    """Fetch headlines from Google News RSS for `query`.
+
+    This is a lightweight fallback when yfinance.news is empty. It performs a
+    search query on Google News RSS and returns a list of headline strings.
+    Uses only stdlib (urllib, xml.etree) to avoid new dependencies.
+    """
+    q = urllib.parse.quote_plus(query)
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read()
+    try:
+        root = ET.fromstring(data)
+    except Exception:
+        return []
+
+    headlines = []
+    # RSS feed structure: /rss/channel/item/title
+    for item in root.findall('.//item')[:max_headlines]:
+        title_el = item.find('title')
+        pub_el = item.find('pubDate')
+        title = title_el.text.strip() if title_el is not None and title_el.text else None
+        pub = pub_el.text.strip() if pub_el is not None and pub_el.text else None
+        if title:
+            headlines.append({'title': title, 'pubDate': pub})
+        if len(headlines) >= max_headlines:
+            break
+    return headlines
+
+
+# simple in-memory cache to avoid repeated RSS/network calls during a single
+# dashboard session. Keyed by query string.
+_RSS_CACHE: Dict[str, List[str]] = {}
+
+
 def get_news_sentiment(symbol: str, max_headlines: int = 5) -> Dict:
     """Fetch recent news for `symbol` and return a simple sentiment score.
 
@@ -48,17 +89,70 @@ def get_news_sentiment(symbol: str, max_headlines: int = 5) -> Dict:
     except Exception:
         news = []
 
-    headlines = []
-    scores = []
+    headlines: List[Dict[str, Any]] = []
+    scores: List[int] = []
     for item in news[:max_headlines]:
         # yfinance news items may have 'title' or 'headline'
         title = item.get('title') or item.get('headline') or ''
+        pub = item.get('providerPublishTime') or item.get('pubDate')
         if title:
-            headlines.append(title)
+            headlines.append({'title': title, 'pubDate': pub})
             scores.append(_score_headline(title))
+
+    # If yfinance provided no headlines (common), try a lightweight RSS
+    # fallback (Google News search) so we still have some text to analyze.
+    if len(headlines) == 0:
+        # Prefer querying by company long name (better results) when available
+        # from yfinance.Ticker.info. Fall back to the raw symbol if that fails.
+        rss_queries = [symbol]
+        try:
+            info = ticker.info or {}
+            name = info.get('longName') or info.get('shortName')
+            if name:
+                # try company name first, then the raw symbol
+                rss_queries.insert(0, name)
+        except Exception:
+            pass
+
+        for q in rss_queries:
+            try:
+                # use cached results when available
+                cached = _RSS_CACHE.get(q)
+                if cached is not None:
+                    rss = cached
+                else:
+                    rss = _fetch_google_news(q, max_headlines)
+                    _RSS_CACHE[q] = rss
+                for t in rss:
+                    # t may be a dict with 'title' and 'pubDate'
+                    if isinstance(t, dict):
+                        title = t.get('title')
+                        pub = t.get('pubDate')
+                    else:
+                        title = t
+                        pub = None
+                    if title:
+                        headlines.append({'title': title, 'pubDate': pub})
+                        scores.append(_score_headline(title))
+                if len(headlines) > 0:
+                    break
+            except Exception:
+                # ignore and try next query
+                continue
 
     total_score = sum(scores)
     # normalize by number of headlines inspected to get a float
+    if len(headlines) == 0:
+        # no headlines available -> report explicit 'no_news' label so callers
+        # can distinguish between neutral sentiment and absence of data.
+        return {
+            'score': 0.0,
+            'label': 'no_news',
+            'headlines': [],
+            'headline_scores': [],
+            'events': [],
+        }
+
     norm = float(total_score) / max(1, len(headlines))
 
     if norm >= 0.5:
@@ -99,10 +193,14 @@ def get_news_sentiment(symbol: str, max_headlines: int = 5) -> Dict:
     except Exception:
         pass
 
-    # return per-headline scores as well
+    # return per-headline scores as well (include pubDate when available)
     headline_scores = []
     for h, s in zip(headlines, scores):
-        headline_scores.append({'headline': h, 'score': s})
+        # h is dict {'title', 'pubDate'}
+        if isinstance(h, dict):
+            headline_scores.append({'headline': h.get('title'), 'score': s, 'pubDate': h.get('pubDate')})
+        else:
+            headline_scores.append({'headline': h, 'score': s, 'pubDate': None})
 
     return {
         'score': norm,
