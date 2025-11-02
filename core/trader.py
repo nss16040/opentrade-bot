@@ -2,14 +2,18 @@ from core.portfolio import Portfolio
 import pandas as pd
 import numpy as np
 
-def run_backtest(df):
+def run_backtest(df, initial_capital=100000):
     """Run a simple backtest over a DataFrame with a 'Signal' column.
 
     Signals should be 1 (buy), -1 (sell) or 0 (hold). NaNs are treated as 0.
     The function only updates last_signal when a non-zero signal occurs to avoid
     propagating NaN values.
+
+    initial_capital: starting cash balance to seed the Portfolio (default 100000)
     """
-    portfolio = Portfolio()
+    # pass the initial capital through to the Portfolio so callers (UI/tests)
+    # can control the starting cash used by the backtest.
+    portfolio = Portfolio(cash=initial_capital)
     last_signal = 0
 
     def _scalar_signal(val):
